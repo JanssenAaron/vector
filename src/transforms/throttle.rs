@@ -1,10 +1,13 @@
-use std::{num::NonZeroU32, pin::Pin, time::Duration};
-
 use async_stream::stream;
 use futures::{Stream, StreamExt};
+use governor::middleware::NoOpMiddleware;
+use governor::state::keyed::DashMapStateStore;
 use governor::{clock, Quota, RateLimiter};
 use serde_with::serde_as;
 use snafu::Snafu;
+use std::hash::Hash;
+use std::{num::NonZeroU32, pin::Pin, time::Duration};
+use std::sync::Arc;
 use vector_lib::config::{clone_input_definitions, LogNamespace};
 use vector_lib::configurable::configurable_component;
 
@@ -45,26 +48,26 @@ pub struct ThrottleConfig {
     /// The number of events allowed for a given bucket per configured `window_secs`.
     ///
     /// Each unique key has its own `threshold`.
-    threshold: u32,
+    pub threshold: u32,
 
     /// The time window in which the configured `threshold` is applied, in seconds.
     #[serde_as(as = "serde_with::DurationSecondsWithFrac<f64>")]
     #[configurable(metadata(docs::human_name = "Time Window"))]
-    window_secs: Duration,
+    pub window_secs: Duration,
 
     /// The value to group events into separate buckets to be rate limited independently.
     ///
     /// If left unspecified, or if the event doesn't have `key_field`, then the event is not rate
     /// limited separately.
     #[configurable(metadata(docs::examples = "{{ message }}", docs::examples = "{{ hostname }}",))]
-    key_field: Option<Template>,
+    pub key_field: Option<Template>,
 
     /// A logical condition used to exclude events from sampling.
-    exclude: Option<AnyCondition>,
+    pub exclude: Option<AnyCondition>,
 
     #[configurable(derived)]
     #[serde(default)]
-    internal_metrics: ThrottleInternalMetricsConfig,
+    pub internal_metrics: ThrottleInternalMetricsConfig,
 }
 
 impl_generate_config_from_default!(ThrottleConfig);
@@ -96,17 +99,17 @@ impl TransformConfig for ThrottleConfig {
 
 #[derive(Clone)]
 pub struct Throttle<C: clock::Clock<Instant = I>, I: clock::Reference> {
-    quota: Quota,
-    flush_keys_interval: Duration,
+    pub quota: Quota,
+    pub flush_keys_interval: Duration,
     key_field: Option<Template>,
     exclude: Option<Condition>,
-    clock: C,
+    pub clock: C,
     internal_metrics: ThrottleInternalMetricsConfig,
 }
 
 impl<C, I> Throttle<C, I>
 where
-    C: clock::Clock<Instant = I>,
+    C: clock::Clock<Instant = I> + Send + Sync + 'static + Clone,
     I: clock::Reference,
 {
     pub fn new(
@@ -142,11 +145,63 @@ where
             internal_metrics: config.internal_metrics.clone(),
         })
     }
+
+    #[must_use]
+    pub fn start_rate_limiter<K>(&self) -> RateLimiterRunner<K, C>
+    where
+        K: Hash + Eq + Clone + Send + Sync + 'static,
+    {
+        RateLimiterRunner::start(self.quota, self.clock.clone(), self.flush_keys_interval)
+    }
+}
+
+pub struct RateLimiterRunner<K, C>
+where
+    K: Hash + Eq + Clone,
+    C: clock::Clock,
+{
+    pub rate_limiter: Arc<RateLimiter<K, DashMapStateStore<K>, C, NoOpMiddleware<C::Instant>>>,
+    flush_handle: tokio::task::JoinHandle<()>,
+}
+
+impl<K, C> RateLimiterRunner<K, C>
+where
+    K: Hash + Eq + Clone + Send + Sync + 'static,
+    C: clock::Clock + Clone + Send + Sync + 'static,
+{
+    pub fn start(quota: Quota, clock: C, flush_keys_interval: Duration) -> Self {
+        let rate_limiter =  Arc::new(RateLimiter::dashmap_with_clock(quota, clock));
+
+        let rate_limiter_clone = Arc::clone(&rate_limiter);
+        let flush_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(flush_keys_interval);
+            loop {
+                interval.tick().await;
+                rate_limiter_clone.retain_recent();
+            }
+        });
+
+
+        Self { rate_limiter, flush_handle }
+    }
+
+    pub fn check_key(&self, key: &K) -> bool {
+        self.rate_limiter.check_key(key).is_ok()
+    }
+}
+
+impl<K, C> Drop for RateLimiterRunner<K, C> where
+    K: Hash + Eq + Clone,
+    C: clock::Clock,
+{
+    fn drop(&mut self) {
+        self.flush_handle.abort();
+    }
 }
 
 impl<C, I> TaskTransform<Event> for Throttle<C, I>
 where
-    C: clock::Clock<Instant = I> + Send + 'static + Clone,
+    C: clock::Clock<Instant = I> + Send + Sync + 'static + Clone,
     I: clock::Reference + Send + 'static,
 {
     fn transform(
@@ -156,68 +211,46 @@ where
     where
         Self: 'static,
     {
-        let mut flush_keys = tokio::time::interval(self.flush_keys_interval * 2);
-
-        let limiter = RateLimiter::dashmap_with_clock(self.quota, self.clock.clone());
+        let limiter = self.start_rate_limiter();
 
         Box::pin(stream! {
-          loop {
-            let done = tokio::select! {
-                biased;
+            while let Some(event) = input_rx.next().await {
+                let (throttle, event) = match self.exclude.as_ref() {
+                    Some(condition) => {
+                        let (result, event) = condition.check(event);
+                        (!result, event)
+                    },
+                    _ => (true, event)
+                };
+                let output = if throttle {
+                    let key = self.key_field.as_ref().and_then(|t| {
+                        t.render_string(&event)
+                            .map_err(|error| {
+                                emit!(TemplateRenderingError {
+                                    error,
+                                    field: Some("key_field"),
+                                    drop_event: false,
+                                })
+                            })
+                            .ok()
+                    });
 
-                maybe_event = input_rx.next() => {
-                    match maybe_event {
-                        None => true,
-                        Some(event) => {
-                            let (throttle, event) = match self.exclude.as_ref() {
-                                Some(condition) => {
-                                    let (result, event) = condition.check(event);
-                                    (!result, event)
-                                },
-                                _ => (true, event)
-                            };
-                            let output = if throttle {
-                                let key = self.key_field.as_ref().and_then(|t| {
-                                    t.render_string(&event)
-                                        .map_err(|error| {
-                                            emit!(TemplateRenderingError {
-                                                error,
-                                                field: Some("key_field"),
-                                                drop_event: false,
-                                            })
-                                        })
-                                        .ok()
-                                });
-
-                                match limiter.check_key(&key) {
-                                    Ok(()) => {
-                                        Some(event)
-                                    }
-                                    _ => {
-                                        emit!(ThrottleEventDiscarded{
-                                            key: key.unwrap_or_else(|| "None".to_string()),
-                                            emit_events_discarded_per_key: self.internal_metrics.emit_events_discarded_per_key
-                                        });
-                                        None
-                                    }
-                                }
-                            } else {
-                                Some(event)
-                            };
-                            if let Some(event) = output {
-                                yield event;
-                            }
-                            false
-                        }
+                    if limiter.check_key(&key) {
+                        Some(event)
+                    } else {
+                        emit!(ThrottleEventDiscarded{
+                            key: key.unwrap_or_else(|| "None".to_string()),
+                            emit_events_discarded_per_key: self.internal_metrics.emit_events_discarded_per_key
+                        });
+                        None
                     }
+                } else {
+                    Some(event)
+                };
+                if let Some(event) = output {
+                    yield event;
                 }
-                _ = flush_keys.tick() => {
-                    limiter.retain_recent();
-                    false
-                }
-            };
-            if done { break }
-          }
+            }
         })
     }
 }
